@@ -4,7 +4,7 @@ from config import DATABASE_URL
 from models import Transaction
 
 class ReadOnlyDB:
-    def __init__(self, batch_size=10000):
+    def __init__(self, batch_size=1_000_000):
         self.engine = create_engine(DATABASE_URL)
         self.Session = sessionmaker(bind=self.engine)
         self.batch_size = batch_size  # лимит батча по умолчанию
