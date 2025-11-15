@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Text2SQL Streaming</title>
+<style>
+  body { font-family: Arial, sans-serif; padding: 20px; }
+  #output { white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: scroll; }
+  input[type="text"] { width: 300px; }
+</style>
+</head>
+<body>
+
+<h2>Text2SQL Streaming Demo</h2>
+
+<label for="textInput">Введите текст для обработки:</label><br>
+<input type="text" id="textInput" placeholder="Например: 'Покажи все транзакции из Шымкента за 2024'">
+<button id="sendBtn">Отправить</button>
+
+<h3>Результат:</h3>
+<div id="output"></div>
+
+<script>
+document.getElementById("sendBtn").addEventListener("click", async () => {
+    const text = document.getElementById("textInput").value;
+    if (!text) return;
+
+    const outputDiv = document.getElementById("output");
+    outputDiv.textContent = ""; // Очистка
+
+    try {
+        const response = await fetch(`http://localhost:8002/process-text?text=${encodeURIComponent(text)}`);
+        if (!response.ok) throw new Error(`Ошибка сервера: ${response.status}`);
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let done = false;
+
+        while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            done = readerDone;
+            if (value) {
+                const chunk = decoder.decode(value, { stream: true });
+                outputDiv.textContent += chunk; // Добавляем полученный кусок
+                outputDiv.scrollTop = outputDiv.scrollHeight; // Автопрокрутка
+            }
+        }
+    } catch (err) {
+        outputDiv.textContent = `Ошибка: ${err.message}`;
+    }
+});
+</script>
+
+</body>
+</html>
