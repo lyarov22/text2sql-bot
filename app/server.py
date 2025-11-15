@@ -29,10 +29,8 @@ async def process_text_stream(req: UserQuery):
     print(f"Received query from user {req.user_id}: {query}")
 
     try:
-        # Используем новый пайплайн с поддержкой контекста
         final_response: FinalResponse = await engine.process_user_request(req)
         
-        # Проверяем, требуется ли уточнение
         if final_response.metadata.get("requires_clarification", False):
             return JSONResponse(content={
                 "content": final_response.content,
@@ -50,14 +48,11 @@ async def process_text_stream(req: UserQuery):
         
         print("Generated SQL:", sql_query)
         
-        # Выполняем запрос и получаем результат
         execution_result = await execute_sql_query(sql_query, query)
         
-        # Для формата "text" генерируем развернутый текстовый ответ
         processed_data = execution_result.data
         text_content = final_response.content
         if final_response.output_format == "text":
-            # Генерируем развернутый ответ через Gemini
             text_response = await engine.format_text_response(
                 query,
                 execution_result.data,
@@ -66,20 +61,16 @@ async def process_text_stream(req: UserQuery):
             text_content = text_response
             processed_data = [{"text": text_response}]
         elif final_response.output_format in ["table", "graph", "diagram"]:
-            # Для табличного формата и графиков переводим названия столбцов на язык запроса
-            # И округляем float значения до 2 знаков после запятой
             processed_data = await engine.translate_column_names(
                 execution_result.data,
                 query,
                 req.user_id
             )
-            # Округляем float значения до 2 знаков после запятой
             for row in processed_data:
                 for key, value in row.items():
                     if isinstance(value, float):
                         row[key] = round(value, 2)
         
-        # Формируем финальный ответ
         response_data = {
             "content": text_content if final_response.output_format == "text" else final_response.content,
             "output_format": final_response.output_format,
@@ -100,45 +91,6 @@ async def process_text_stream(req: UserQuery):
     except Exception as e:
         print(f"Error processing request: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
-@app.post("/process-text-stream")
-async def process_text_stream_legacy(req: UserQuery):
-    """Legacy endpoint для стриминга (обратная совместимость)"""
-    query = req.natural_language_query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Field 'natural_language_query' is required")
-    
-    print(f"Received query from user {req.user_id}: {query}")
-
-    try:
-        # Используем новый пайплайн с поддержкой контекста
-        final_response: FinalResponse = await engine.process_user_request(req)
-        
-        # Проверяем, требуется ли уточнение
-        if final_response.metadata.get("requires_clarification", False):
-            return JSONResponse(content={
-                "content": final_response.content,
-                "output_format": final_response.output_format,
-                "metadata": final_response.metadata
-            })
-        
-        sql_query = final_response.metadata.get("sql_query", final_response.content)
-        
-        if not sql_query:
-            raise HTTPException(status_code=400, detail="Failed to generate SQL from the query")
-
-        print("Generated SQL:", sql_query)
-        
-        # Используем стриминг для больших результатов
-        return StreamingResponse(stream_select_query(sql_query), media_type="application/json")
-        
-    except SecurityException as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except Exception as e:
-        print(f"Error processing request: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
 
 class ClearHistoryRequest(BaseModel):
     user_id: str
