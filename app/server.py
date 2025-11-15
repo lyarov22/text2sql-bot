@@ -65,6 +65,19 @@ async def process_text_stream(req: UserQuery):
             )
             text_content = text_response
             processed_data = [{"text": text_response}]
+        elif final_response.output_format in ["table", "graph", "diagram"]:
+            # Для табличного формата и графиков переводим названия столбцов на язык запроса
+            # И округляем float значения до 2 знаков после запятой
+            processed_data = await engine.translate_column_names(
+                execution_result.data,
+                query,
+                req.user_id
+            )
+            # Округляем float значения до 2 знаков после запятой
+            for row in processed_data:
+                for key, value in row.items():
+                    if isinstance(value, float):
+                        row[key] = round(value, 2)
         
         # Формируем финальный ответ
         response_data = {

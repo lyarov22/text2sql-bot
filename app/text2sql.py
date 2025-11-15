@@ -155,9 +155,292 @@ class ProductionLLMContract:
         if user_id in self.conversation_history:
             del self.conversation_history[user_id]
     
+    def _detect_language(self, text: str) -> str:
+        """Определение языка текста (ru, kk, en)"""
+        # Простая эвристика для определения языка
+        # Можно улучшить через Gemini API, но для скорости используем эвристику
+        
+        text_lower = text.lower()
+        
+        # Казахский язык - специфические символы (высокий приоритет)
+        kazakh_chars = ['ә', 'ғ', 'қ', 'ң', 'ө', 'ұ', 'ү', 'һ', 'і']
+        if any(char in text_lower for char in kazakh_chars):
+            return "kk"
+        
+        # Проверка на кириллицу (русский или казахский)
+        has_cyrillic = any('\u0400' <= char <= '\u04FF' for char in text)
+        
+        if has_cyrillic:
+            # Сначала проверяем казахские слова (специфичные)
+            kazakh_words = ['қанша', 'неше', 'қайда', 'қашан', 'кім', 'не', 'бар', 'жоқ', 'саны', 'жылы', 'айы', 'транзакциялар', 'мерчанттар']
+            if any(word in text_lower for word in kazakh_words):
+                return "kk"
+            
+            # Затем проверяем русские слова (более общие)
+            russian_words = ['статистика', 'транзакции', 'транзакций', 'месяц', 'месяца', 'месяцев', 'год', 'года', 'лет', 
+                           'таблица', 'таблицу', 'таблицы', 'дай', 'дайте', 'покажи', 'покажите', 'разбей', 'разбейте',
+                           'количество', 'сумма', 'итого', 'всего', 'мерчант', 'мерчанта', 'мерчанты', 'за', 'по', 'все']
+            if any(word in text_lower for word in russian_words):
+                return "ru"
+            
+            # Если есть кириллица, но нет специфичных слов - по умолчанию русский
+            return "ru"
+        
+        # По умолчанию английский
+        return "en"
+    
+    def _get_language_name(self, lang_code: str) -> str:
+        """Получение названия языка для промптов"""
+        lang_names = {
+            "ru": "русском",
+            "kk": "казахском", 
+            "en": "английском"
+        }
+        return lang_names.get(lang_code, "русском")
+    
+    def _is_already_translated(self, columns: List[str]) -> bool:
+        """Проверяет, переведены ли уже названия столбцов (на русский или казахский)"""
+        # Проверяем наличие кириллицы в названиях столбцов
+        for col in columns:
+            if any('\u0400' <= char <= '\u04FF' for char in col):
+                return True
+        return False
+    
+    async def translate_column_names(
+        self, 
+        data: List[Dict[str, Any]], 
+        user_query: str,
+        user_id: str
+    ) -> List[Dict[str, Any]]:
+        """Перевод названий столбцов на язык запроса пользователя"""
+        if not data:
+            return data
+        
+        # Получаем список всех уникальных названий столбцов
+        all_columns = set()
+        for row in data:
+            all_columns.update(row.keys())
+        
+        columns_list = list(all_columns)
+        
+        detected_lang = self._detect_language(user_query)
+        print(f"Detected language for column translation: {detected_lang}, query: {user_query[:100]}")
+        
+        if detected_lang == "en":
+            # Для английского языка перевод не нужен
+            return data
+        
+        # Проверяем, не переведены ли уже столбцы
+        if self._is_already_translated(columns_list):
+            # Определяем язык текущих названий столбцов
+            first_col = columns_list[0] if columns_list else ""
+            has_kazakh_chars = any(char in first_col for char in ['ә', 'ғ', 'қ', 'ң', 'ө', 'ұ', 'ү', 'һ', 'і'])
+            
+            # Если запрос на русском, а столбцы на казахском - нужно перевести на русский
+            if detected_lang == "ru" and has_kazakh_chars:
+                # Переводим с казахского на русский
+                # Используем обратный перевод через Gemini
+                prompt = f"""
+                Переведи названия столбцов с казахского языка на русский язык.
+                
+                КАЗАХСКИЕ НАЗВАНИЯ СТОЛБЦОВ:
+                {json.dumps(columns_list, ensure_ascii=False, indent=2)}
+                
+                Переведи каждое название столбца с казахского на русский язык естественным и понятным образом.
+                Примеры:
+                - Транзакция жылы -> Год транзакции
+                - Транзакция айы -> Месяц транзакции
+                - Транзакциялар саны -> Количество транзакций
+                - Жалпы сома (KZT) -> Общая сумма (KZT)
+                - Мерчант ID -> ID мерчанта
+                
+                Верни JSON объект, где ключи - казахские названия, значения - русские переводы:
+                {{
+                    "Транзакция жылы": "Год транзакции",
+                    "Транзакция айы": "Месяц транзакции",
+                    ...
+                }}
+                """
+                system_instruction = "Ты переводишь названия столбцов с казахского языка на русский язык. Давай естественные и понятные переводы."
+            elif detected_lang == "kk" and not has_kazakh_chars:
+                # Запрос на казахском, а столбцы на русском - переводим на казахский
+                prompt = f"""
+                Келесі баған атауларын орыс тілінен қазақ тіліне аудар.
+                
+                ОРЫС БАҒАН АТАУЛАРЫ:
+                {json.dumps(columns_list, ensure_ascii=False, indent=2)}
+                
+                Әрбір баған атауын орыс тілінен қазақ тіліне табиғи және түсінікті түрде аудар.
+                Мысалы:
+                - Год транзакции -> Транзакция жылы
+                - Месяц транзакции -> Транзакция айы
+                - Количество транзакций -> Транзакциялар саны
+                - Общая сумма (KZT) -> Жалпы сома (KZT)
+                
+                Верни JSON объект, где ключи - русские названия, значения - казахские переводы:
+                {{
+                    "Год транзакции": "Транзакция жылы",
+                    "Месяц транзакции": "Транзакция айы",
+                    ...
+                }}
+                """
+                system_instruction = "Сен баған атауларын орыс тілінен қазақ тіліне аударасың. Табиғи және түсінікті аудармалар бер."
+            else:
+                # Язык совпадает - возвращаем как есть
+                return data
+            
+            # Выполняем обратный перевод
+            try:
+                response = self._call_gemini(
+                    system_instruction,
+                    prompt,
+                    conversation_history=None,
+                    use_history=False
+                )
+                
+                # Парсим JSON ответ
+                response_clean = response.strip()
+                if response_clean.startswith("```"):
+                    parts = response_clean.split("```")
+                    if len(parts) >= 3:
+                        json_part = parts[1]
+                        if json_part.startswith("json"):
+                            json_part = json_part[4:].strip()
+                        response_clean = json_part.strip()
+                
+                json_start = response_clean.find("{")
+                json_end = response_clean.rfind("}")
+                if json_start != -1 and json_end != -1:
+                    json_str = response_clean[json_start:json_end + 1]
+                    translations = json.loads(json_str)
+                    
+                    # Применяем переводы к данным
+                    translated_data = []
+                    for row in data:
+                        translated_row = {}
+                        for key, value in row.items():
+                            translated_key = translations.get(key, key)
+                            translated_row[translated_key] = value
+                        translated_data.append(translated_row)
+                    
+                    return translated_data
+            except Exception as e:
+                print(f"Error re-translating column names: {e}")
+                # В случае ошибки возвращаем оригинальные данные
+                return data
+        
+        # Формируем промпт для перевода
+        if detected_lang == "kk":
+            prompt = f"""
+            Келесі SQL сұрауының нәтижелерінен алынған баған атауларын қазақ тіліне аудар.
+            
+            БАҒАН АТАУЛАРЫ:
+            {json.dumps(columns_list, ensure_ascii=False, indent=2)}
+            
+            Әрбір баған атауын қазақ тіліне табиғи және түсінікті түрде аудар.
+            Мысалы:
+            - transaction_count -> Транзакциялар саны
+            - merchant_id -> Мерчант ID
+            - total_amount -> Жалпы сома
+            - avg_amount -> Орташа сома
+            - transaction_amount_kzt -> Транзакция сомасы (KZT)
+            - mcc_category -> MCC санаты
+            - merchant_city -> Мерчант қаласы
+            - transaction_year -> Транзакция жылы
+            - transaction_month -> Транзакция айы
+            - total_transactions -> Транзакциялар саны
+            - total_amount_kzt -> Жалпы сома (KZT)
+            
+            КРИТИЧЕСКИ ВАЖНО: Запрос пользователя на казахском языке. Переведи ВСЕ названия столбцов на казахский язык.
+            
+            Верни JSON объект, где ключи - оригинальные названия, значения - переводы:
+            {{
+                "transaction_count": "Транзакциялар саны",
+                "merchant_id": "Мерчант ID",
+                ...
+            }}
+            """
+            system_instruction = "Сен баған атауларын қазақ тіліне аударасың. Табиғи және түсінікті аудармалар бер."
+        else:  # Russian
+            prompt = f"""
+            Переведи названия столбцов из результатов SQL запроса на русский язык.
+            
+            НАЗВАНИЯ СТОЛБЦОВ:
+            {json.dumps(columns_list, ensure_ascii=False, indent=2)}
+            
+            Переведи каждое название столбца на русский язык естественным и понятным образом.
+            Примеры:
+            - transaction_count -> Количество транзакций
+            - merchant_id -> ID мерчанта
+            - total_amount -> Общая сумма
+            - avg_amount -> Средняя сумма
+            - transaction_amount_kzt -> Сумма транзакции (KZT)
+            - mcc_category -> Категория MCC
+            - merchant_city -> Город мерчанта
+            - transaction_year -> Год транзакции
+            - transaction_month -> Месяц транзакции
+            - total_transactions -> Количество транзакций
+            - total_amount_kzt -> Общая сумма (KZT)
+            
+            КРИТИЧЕСКИ ВАЖНО: Запрос пользователя на русском языке. Переведи ВСЕ названия столбцов на русский язык.
+            НЕ используй казахский язык для переводов, даже если в истории диалога были казахские сообщения.
+            
+            Верни JSON объект, где ключи - оригинальные названия, значения - переводы:
+            {{
+                "transaction_count": "Количество транзакций",
+                "merchant_id": "ID мерчанта",
+                ...
+            }}
+            """
+            system_instruction = "Ты переводишь названия столбцов на русский язык. Давай естественные и понятные переводы. НЕ используй казахский язык."
+        
+        try:
+            # НЕ используем историю диалога при переводе столбцов, чтобы избежать влияния предыдущих языков
+            response = self._call_gemini(
+                system_instruction,
+                prompt,
+                conversation_history=None,
+                use_history=False  # Не используем историю для перевода
+            )
+            
+            # Парсим JSON ответ
+            response_clean = response.strip()
+            if response_clean.startswith("```"):
+                parts = response_clean.split("```")
+                if len(parts) >= 3:
+                    json_part = parts[1]
+                    if json_part.startswith("json"):
+                        json_part = json_part[4:].strip()
+                    response_clean = json_part.strip()
+            
+            json_start = response_clean.find("{")
+            json_end = response_clean.rfind("}")
+            if json_start != -1 and json_end != -1:
+                json_str = response_clean[json_start:json_end + 1]
+                translations = json.loads(json_str)
+                
+                # Применяем переводы к данным
+                translated_data = []
+                for row in data:
+                    translated_row = {}
+                    for key, value in row.items():
+                        translated_key = translations.get(key, key)
+                        translated_row[translated_key] = value
+                    translated_data.append(translated_row)
+                
+                return translated_data
+        except Exception as e:
+            print(f"Error translating column names: {e}")
+            # В случае ошибки возвращаем оригинальные данные
+            return data
+        
+        return data
+    
     async def _determine_output_format(self, user_query: UserQuery) -> FormatDecision:
         """Определение формата вывода с учетом контекста истории"""
         history = self._get_history(user_query.user_id)
+        detected_lang = self._detect_language(user_query.natural_language_query)
+        lang_name = self._get_language_name(detected_lang)
         
         context_prompt = ""
         if history:
@@ -169,33 +452,61 @@ class ProductionLLMContract:
                 text = content.parts[0].text if content.parts else ""
                 context_prompt += f"{role}: {text}\n"
         
+        # Формируем примеры в зависимости от языка
+        if detected_lang == "kk":
+            format_examples = """
+            ПРИМЕРЫ:
+            - "Қанша транзакция бар?" -> output_format: "text", clarification_question: null
+            - "Транзакциялар тізімі" -> output_format: "table", clarification_question: null
+            - "График көрсет" -> output_format: "graph", clarification_question: null
+            """
+        elif detected_lang == "en":
+            format_examples = """
+            EXAMPLES:
+            - "How many transactions?" -> output_format: "text", clarification_question: null
+            - "List transactions" -> output_format: "table", clarification_question: null
+            - "Show graph" -> output_format: "graph", clarification_question: null
+            """
+        else:  # Russian
+            format_examples = """
+            ПРИМЕРЫ:
+            - "Сколько транзакций?" -> output_format: "text", clarification_question: null
+            - "Список транзакций" -> output_format: "table", clarification_question: null
+            - "Покажи график" -> output_format: "graph", clarification_question: null
+            """
+        
         prompt = f"""
         Определи формат вывода для запроса пользователя с учетом контекста предыдущих сообщений.
         {context_prompt}
         
         ТЕКУЩИЙ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: {user_query.natural_language_query}
         
+        {format_examples}
+        
         Возможные форматы:
-        - "text": текстовый ответ, статистика, описания
-        - "table": табличные данные, списки транзакций
-        - "graph": данные для графиков (временные ряды, сравнения)
+        - "text": текстовый ответ, статистика, описания, вопросы "сколько", "сколько всего"
+        - "table": табличные данные, списки транзакций, "покажи", "выведи список"
+        - "graph": данные для графиков (временные ряды, сравнения), "график", "диаграмма"
         - "diagram": диаграммы, распределения
         
         ВАЖНО:
         - Пользователь может менять формат вывода в рамках одного диалога - это нормально
         - Если пользователь сначала запросил текст, а потом таблицу - это не требует уточнения
-        - Требуй уточнение ТОЛЬКО если запрос действительно неясен (не указаны параметры, даты, фильтры)
-        - НЕ требуй уточнение только из-за смены формата вывода
+        - Делай умные предположения: общие вопросы о количестве = формат "text"
+        - Требуй уточнение ТОЛЬКО если запрос действительно неясен и невозможно определить формат
         
-        Если запрос неясен или требует уточнения (например, не указаны параметры, даты, фильтры),
-        верни clarification_question с уточняющим вопросом на русском языке.
-        Если запрос понятен, даже если формат отличается от предыдущего, верни clarification_question: null.
+        КРИТИЧЕСКИ ВАЖНО: Запрос пользователя на {lang_name} языке.
+        Если нужно задать уточняющий вопрос, верни его СТРОГО на {lang_name} языке.
+        
+        В большинстве случаев запросы ПОНЯТНЫ и не требуют уточнения.
+        Верни clarification_question: null, если можно определить формат или сделать предположение.
+        Верни clarification_question ТОЛЬКО если запрос действительно неясен.
         
         Верни JSON:
         {{
             "output_format": "text|table|graph|diagram",
             "confidence_score": 0.0-1.0,
-            "clarification_question": null или "уточняющий вопрос на русском",
+            "clarification_question": null или "уточняющий вопрос на {lang_name} языке",
             "refined_query": "уточненный запрос пользователя с учетом контекста"
         }}
         """
@@ -270,6 +581,12 @@ class ProductionLLMContract:
         - Validate against user intent
         - Only SELECT queries allowed
         - Учитывай контекст предыдущих сообщений при интерпретации запроса
+        
+        КРИТИЧЕСКИ ВАЖНО:
+        - Все названия столбцов в SQL запросе ДОЛЖНЫ быть на английском языке
+        - Используй английские названия для AS алиасов: transaction_year, transaction_month, total_count, total_amount
+        - НЕ используй кириллицу или казахские символы в названиях столбцов SQL
+        - Примеры правильных названий: transaction_year, transaction_month, total_transactions, total_amount_kzt
         
         Return JSON:
         {{
@@ -409,30 +726,72 @@ class ProductionLLMContract:
     async def _check_query_clarity(self, user_query: UserQuery) -> Optional[str]:
         """Проверка ясности запроса и возврат уточняющего вопроса если нужно"""
         history = self._get_history(user_query.user_id)
+        detected_lang = self._detect_language(user_query.natural_language_query)
+        lang_name = self._get_language_name(detected_lang)
+        
+        # Формируем примеры умных предположений в зависимости от языка
+        if detected_lang == "kk":
+            examples = """
+            ПРИМЕРЫ УМНЫХ ПРЕДПОЛОЖЕНИЙ:
+            - "Қанша транзакция бар?" -> ПОНЯТНО: все транзакции за все время (is_clear: true)
+            - "Транзакциялар саны?" -> ПОНЯТНО: все транзакции (is_clear: true)
+            - "Барлық транзакциялар" -> ПОНЯТНО: все транзакции (is_clear: true)
+            - "Топ мерчанттар" -> ПОНЯТНО: топ по количеству/сумме (is_clear: true)
+            - "Алматыдағы транзакциялар" -> ПОНЯТНО: транзакции в Алматы (is_clear: true)
+            """
+        elif detected_lang == "en":
+            examples = """
+            EXAMPLES OF SMART ASSUMPTIONS:
+            - "How many transactions?" -> CLEAR: all transactions (is_clear: true)
+            - "Count transactions" -> CLEAR: all transactions (is_clear: true)
+            - "All transactions" -> CLEAR: all transactions (is_clear: true)
+            - "Top merchants" -> CLEAR: top by count/amount (is_clear: true)
+            - "Transactions in Almaty" -> CLEAR: transactions in Almaty (is_clear: true)
+            """
+        else:  # Russian
+            examples = """
+            ПРИМЕРЫ УМНЫХ ПРЕДПОЛОЖЕНИЙ:
+            - "Сколько транзакций?" -> ПОНЯТНО: все транзакции за все время (is_clear: true)
+            - "Количество транзакций" -> ПОНЯТНО: все транзакции (is_clear: true)
+            - "Все транзакции" -> ПОНЯТНО: все транзакции (is_clear: true)
+            - "Топ мерчанты" -> ПОНЯТНО: топ по количеству/сумме (is_clear: true)
+            - "Транзакции в Алматы" -> ПОНЯТНО: транзакции в Алматы (is_clear: true)
+            """
         
         prompt = f"""
         Проанализируй запрос пользователя и определи, достаточно ли информации для его выполнения.
         
         ЗАПРОС: {user_query.natural_language_query}
         
-        Проверь:
-        1. Указаны ли необходимые параметры (даты, фильтры, категории)?
-        2. Понятно ли намерение пользователя?
-        3. Есть ли неоднозначности в запросе?
+        {examples}
         
-        ВАЖНО:
-        - Пользователь может менять формат вывода (текст/таблица/график) - это НЕ требует уточнения
-        - Пользователь может задавать разные вопросы в рамках одного диалога - это нормально
-        - Требуй уточнение ТОЛЬКО если запрос действительно неполон или неясен
-        - НЕ требуй уточнение только из-за смены формата или типа запроса
+        ПРАВИЛА АНАЛИЗА:
+        1. Если запрос содержит общие вопросы (сколько, количество, все, топ) БЕЗ указания периода - это ПОНЯТНО, значит "за все время"
+        2. Если запрос содержит фильтры (город, категория, тип) - это ПОНЯТНО, даже без даты
+        3. Если намерение пользователя очевидно из контекста - это ПОНЯТНО
+        4. Делай умные предположения вместо переспрашивания
         
-        Если запрос неясен или неполон (не указаны критичные параметры), верни уточняющий вопрос на русском языке.
-        Если запрос понятен, даже если он отличается от предыдущих запросов, верни is_clear: true.
+        КОГДА ТРЕБОВАТЬ УТОЧНЕНИЕ (только в критических случаях):
+        - Запрос полностью неясен или бессмыслен
+        - Есть конфликтующие требования (например, "топ-10" и "все" одновременно)
+        - Запрос слишком абстрактный без возможности предположения
+        
+        КОГДА НЕ ТРЕБОВАТЬ УТОЧНЕНИЕ:
+        - Общие вопросы о количестве/сумме/топе - делай предположение "за все время"
+        - Вопросы с фильтрами без даты - используй все доступные данные
+        - Понятные запросы, даже если не указаны все параметры
+        
+        КРИТИЧЕСКИ ВАЖНО: Запрос пользователя на {lang_name} языке. 
+        Если нужно задать уточняющий вопрос, верни его СТРОГО на {lang_name} языке.
+        
+        В большинстве случаев запросы ПОНЯТНЫ и не требуют уточнения. 
+        Верни is_clear: true, если можно сделать разумное предположение.
+        Верни is_clear: false ТОЛЬКО если запрос действительно неясен и невозможно предположить намерение.
         
         Верни JSON:
         {{
             "is_clear": true/false,
-            "clarification_question": "уточняющий вопрос на русском или null"
+            "clarification_question": "уточняющий вопрос на {lang_name} языке или null"
         }}
         """
         
@@ -471,8 +830,76 @@ class ProductionLLMContract:
         clarification_lower = clarification.lower()
         return any(keyword in clarification_lower for keyword in format_keywords)
     
+    def _is_short_answer(self, query: str) -> bool:
+        """Проверяет, является ли запрос коротким ответом на уточняющий вопрос"""
+        short_answers = {
+            "ru": ["все", "все время", "все данные", "за все время", "всего", "да", "нет"],
+            "kk": ["барлық", "барлық уақыт", "барлық деректер", "барлық уақытта", "барлығы", "иә", "жоқ"],
+            "en": ["all", "all time", "all data", "everything", "yes", "no"]
+        }
+        detected_lang = self._detect_language(query)
+        query_lower = query.lower().strip()
+        return query_lower in short_answers.get(detected_lang, short_answers["ru"])
+    
+    def _expand_short_answer(self, short_answer: str, context: str, lang: str) -> str:
+        """Расширяет короткий ответ на основе контекста предыдущего вопроса"""
+        # Ищем ключевые слова в контексте
+        context_lower = context.lower()
+        
+        if lang == "kk":
+            if "транзакция" in context_lower or "транзакциялар" in context_lower:
+                if "қанша" in context_lower or "саны" in context_lower:
+                    return "Барлық транзакциялар саны"
+                return "Барлық транзакциялар"
+            elif "мерчант" in context_lower:
+                return "Барлық мерчанттар"
+            return "Барлық деректер"
+        elif lang == "en":
+            if "transaction" in context_lower:
+                if "how many" in context_lower or "count" in context_lower:
+                    return "Count all transactions"
+                return "All transactions"
+            elif "merchant" in context_lower:
+                return "All merchants"
+            return "All data"
+        else:  # Russian
+            if "транзакц" in context_lower:
+                if "сколько" in context_lower or "количество" in context_lower:
+                    return "Количество всех транзакций"
+                return "Все транзакции"
+            elif "мерчант" in context_lower:
+                return "Все мерчанты"
+            return "Все данные"
+    
     async def process_user_request(self, user_query: UserQuery) -> FinalResponse:
         """Основной пайплайн обработки запроса с поддержкой контекста"""
+        # Проверяем, является ли это коротким ответом на уточняющий вопрос
+        history = self._get_history(user_query.user_id)
+        if self._is_short_answer(user_query.natural_language_query) and history:
+            # Если это короткий ответ типа "все", расширяем его на основе контекста
+            # Берем последний вопрос ассистента и предыдущий запрос пользователя из истории
+            last_assistant_msg = None
+            last_user_msg = None
+            for content in reversed(history):
+                if content.role == "model" and not last_assistant_msg:
+                    last_assistant_msg = content.parts[0].text if content.parts else ""
+                elif content.role == "user" and not last_user_msg:
+                    last_user_msg = content.parts[0].text if content.parts else ""
+                if last_assistant_msg and last_user_msg:
+                    break
+            
+            # Если был уточняющий вопрос, расширяем короткий ответ
+            if last_assistant_msg and ("уточн" in last_assistant_msg.lower() or "?" in last_assistant_msg):
+                detected_lang = self._detect_language(user_query.natural_language_query)
+                # Используем контекст предыдущего запроса пользователя или вопроса ассистента
+                context = last_user_msg or last_assistant_msg
+                expanded_query = self._expand_short_answer(
+                    user_query.natural_language_query, 
+                    context, 
+                    detected_lang
+                )
+                user_query.natural_language_query = expanded_query
+        
         # Шаг 0: Проверка ясности запроса
         clarification = await self._check_query_clarity(user_query)
         # Игнорируем уточняющие вопросы, связанные только со сменой формата
@@ -547,6 +974,8 @@ class ProductionLLMContract:
     ) -> str:
         """Генерация развернутого текстового ответа на основе результатов SQL запроса"""
         history = self._get_history(user_id)
+        detected_lang = self._detect_language(user_query)
+        lang_name = self._get_language_name(detected_lang)
         
         # Формируем данные для промпта
         data_summary = ""
@@ -555,34 +984,94 @@ class ProductionLLMContract:
             preview_data = sql_result_data[:20]
             data_summary = json.dumps(preview_data, ensure_ascii=False, indent=2)
             if len(sql_result_data) > 20:
-                data_summary += f"\n... и еще {len(sql_result_data) - 20} строк(и)"
+                if detected_lang == "kk":
+                    data_summary += f"\n... және тағы {len(sql_result_data) - 20} жол(дар)"
+                elif detected_lang == "en":
+                    data_summary += f"\n... and {len(sql_result_data) - 20} more row(s)"
+                else:
+                    data_summary += f"\n... и еще {len(sql_result_data) - 20} строк(и)"
         else:
-            data_summary = "Нет данных"
+            if detected_lang == "kk":
+                data_summary = "Деректер жоқ"
+            elif detected_lang == "en":
+                data_summary = "No data"
+            else:
+                data_summary = "Нет данных"
         
-        prompt = f"""
-        Ты - помощник аналитика данных. Пользователь задал вопрос и получил результаты SQL запроса.
-        
-        ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}
-        
-        РЕЗУЛЬТАТЫ SQL ЗАПРОСА:
-        {data_summary}
-        
-        Сформируй развернутый, понятный ответ на русском языке на основе этих данных.
-        Ответ должен быть:
-        - Естественным и дружелюбным, как от чат-бота
-        - Развернутым и информативным
-        - Структурированным (можно использовать списки, если уместно)
-        - Содержать конкретные цифры и факты из данных
-        - Отвечать на вопрос пользователя полностью
-        
-        Если данных нет, вежливо сообщи об этом.
-        
-        Верни ТОЛЬКО текст ответа, без дополнительных пояснений или метаданных.
-        """
+        # Формируем промпт в зависимости от языка
+        if detected_lang == "kk":
+            prompt = f"""
+            Сен - деректер аналитигінің көмекшісі. Пайдаланушы сұрақ қойды және SQL сұрауының нәтижелерін алды.
+            
+            ПАЙДАЛАНУШЫНЫҢ СҰРАҒЫ: {user_query}
+            
+            SQL СҰРАУЫНЫҢ НӘТИЖЕЛЕРІ:
+            {data_summary}
+            
+            Осы деректер негізінде толық, түсінікті жауапты қазақ тілінде құрастыр.
+            Жауап болуы керек:
+            - Табиғи және досалым, чат-бот сияқты
+            - Толық және ақпаратты
+            - Құрылымдалған (қажет болса, тізімдерді пайдалануға болады)
+            - Деректерден нақты сандар мен фактілерді қамтуы керек
+            - Пайдаланушының сұрағына толық жауап беруі керек
+            
+            Егер деректер жоқ болса, мейірімділікпен хабарла.
+            
+            Тек жауап мәтінін қайтар, қосымша түсіндірмелер немесе метадеректерсіз.
+            """
+        elif detected_lang == "en":
+            prompt = f"""
+            You are a data analyst assistant. The user asked a question and received SQL query results.
+            
+            USER'S QUESTION: {user_query}
+            
+            SQL QUERY RESULTS:
+            {data_summary}
+            
+            Form a detailed, clear answer in English based on this data.
+            The answer should be:
+            - Natural and friendly, like from a chatbot
+            - Detailed and informative
+            - Structured (you can use lists if appropriate)
+            - Contain specific numbers and facts from the data
+            - Fully answer the user's question
+            
+            If there is no data, politely inform about it.
+            
+            Return ONLY the answer text, without additional explanations or metadata.
+            """
+        else:  # Russian
+            prompt = f"""
+            Ты - помощник аналитика данных. Пользователь задал вопрос и получил результаты SQL запроса.
+            
+            ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}
+            
+            РЕЗУЛЬТАТЫ SQL ЗАПРОСА:
+            {data_summary}
+            
+            Сформируй развернутый, понятный ответ на русском языке на основе этих данных.
+            Ответ должен быть:
+            - Естественным и дружелюбным, как от чат-бота
+            - Развернутым и информативным
+            - Структурированным (можно использовать списки, если уместно)
+            - Содержать конкретные цифры и факты из данных
+            - Отвечать на вопрос пользователя полностью
+            
+            Если данных нет, вежливо сообщи об этом.
+            
+            Верни ТОЛЬКО текст ответа, без дополнительных пояснений или метаданных.
+            """
         
         try:
+            system_instruction = "Ты - помощник аналитика данных. Формируешь понятные и развернутые ответы на основе данных из базы данных."
+            if detected_lang == "kk":
+                system_instruction = "Сен - деректер аналитигінің көмекшісі. Деректер базасының деректері негізінде түсінікті және толық жауаптар құрастырасың."
+            elif detected_lang == "en":
+                system_instruction = "You are a data analyst assistant. You form clear and detailed answers based on database data."
+            
             response = self._call_gemini(
-                "Ты - помощник аналитика данных. Формируешь понятные и развернутые ответы на основе данных из базы данных.",
+                system_instruction,
                 prompt,
                 conversation_history=history,
                 use_history=True
@@ -594,7 +1083,16 @@ class ProductionLLMContract:
             if sql_result_data:
                 first_row = sql_result_data[0]
                 values = [str(v) for v in first_row.values() if v is not None]
-                return " ".join(values)
+                result = " ".join(values)
+                if detected_lang == "kk":
+                    return result if result else "Деректер табылмады"
+                elif detected_lang == "en":
+                    return result if result else "Data not found"
+                return result if result else "Данные не найдены"
+            if detected_lang == "kk":
+                return "Деректер табылмады"
+            elif detected_lang == "en":
+                return "Data not found"
             return "Данные не найдены"
     
     def generate(self, nl_query: str) -> str:
