@@ -5,6 +5,7 @@ import os
 from google import genai
 from app.config import LLM_API_KEY
 from app.models import Transaction
+from app.sql_to_db import execute_sql_query
 
 # Загружаем переменные окружения
 client = genai.Client(api_key=LLM_API_KEY)
@@ -143,12 +144,36 @@ def main():
             print("\nГенерация SQL запроса...")
             sql_query = generate_sql(user_input)
             
+            # Проверяем, не является ли результат ошибкой
+            if sql_query.startswith("Ошибка"):
+                print("\n" + "=" * 60)
+                print("ОШИБКА:")
+                print("=" * 60)
+                print(sql_query)
+                print("=" * 60)
+                print()
+                continue
+            
+            # Выводим SQL запрос в консоль
             print("\n" + "=" * 60)
             print("Сгенерированный SQL запрос:")
             print("=" * 60)
             print(sql_query)
             print("=" * 60)
             print()
+            
+            # Выполняем SQL запрос в БД
+            print("Выполнение запроса в базе данных...")
+            print()
+            try:
+                execute_sql_query(sql_query)
+            except Exception as db_error:
+                print("\n" + "=" * 60)
+                print("ОШИБКА при выполнении запроса в БД:")
+                print("=" * 60)
+                print(str(db_error))
+                print("=" * 60)
+                print()
             
         except KeyboardInterrupt:
             print("\n\nДо свидания!")
