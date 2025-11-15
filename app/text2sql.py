@@ -26,12 +26,15 @@ TABLE_SCHEMA = {
     "wallet_type": "String wallet type. Only this values: (Bank's QR, Samsung Pay, Google Pay, Apple Pay)"
 }
 
+DEFAULT_LIMIT = 100000
 
 SYSTEM_PROMPT = f"""
 You are an enterprise Text2SQL generator. Output only SQL. Use table 'transactions'. Use lowercase column names.
 All data in the database is stored in English. For example, city names, bank names, MCC categories, transaction types, currencies are all in English.
 If the user speaks Russian or Kazakh, translate their intent to English values where appropriate. 
 Always output SQL in English syntax and using English values.
+
+If listing rows and no limit is given, apply LIMIT {DEFAULT_LIMIT}.
 Allowed operations: SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, AVG, SUM, COUNT, MIN, MAX.
 Dates filtered through transaction_timestamp.
 Amounts filtered through transaction_amount_kzt.
@@ -76,19 +79,21 @@ class Text2SQLGenerator:
         config = types.GenerateContentConfig(
             system_instruction=None,  # system instruction is passed via content parts
             temperature=0.0,
-            max_output_tokens=800
+            max_output_tokens=1500
         )
         response = client.models.generate_content(
             model=self.model,
             contents=[contents],
             config=config
         )
-        return response.text.strip()
+        print(response)
+        return response.text
 
     def generate(self, nl_query: str) -> str:
         step1 = self._call(SYSTEM_PROMPT, ITER_1 + "\n" + nl_query)
         print(step1)
         step2 = self._call(SYSTEM_PROMPT, ITER_2 + "\n" + step1)
+        print(step2)
         return step2
 
 def build_text2sql():

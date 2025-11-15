@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from app.text2sql import build_text2sql
 from app.sql_streamer import stream_select_query
-from fastapi.middleware.cors import CORSMiddleware
-
 
 app = FastAPI()
 
@@ -16,14 +16,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/process-text")
-def process_text_stream(text: str = Query(..., description="Текст для обработки")):
+# Модель запроса
+class TextRequest(BaseModel):
+    text: str
+
+@app.post("/process-text")
+def process_text_stream(req: TextRequest):
+    text = req.text.strip()
     if not text:
-        raise HTTPException(status_code=400, detail="Query parameter 'text' is required")
-    print(text)
+        raise HTTPException(status_code=400, detail="Field 'text' is required")
+    
+    print("Received text:", text)
 
     sql = engine.generate(text)
-    print(sql)
+    print("Generated SQL:", sql)
     if not sql:
         raise HTTPException(status_code=400, detail="Failed to generate SQL from the text")
 
@@ -32,10 +38,12 @@ def process_text_stream(text: str = Query(..., description="Текст для о
 
     return StreamingResponse(stream_select_query(sql), media_type="application/json")
 
-
-@app.get("/stream-sql")
-def stream_sql(q: str = Query(..., description="SQL SELECT запрос")):
+@app.post("/stream-sql")
+def stream_sql(req: TextRequest):
     """Стриминг SELECT запроса напрямую (для отладки)."""
+    q = req.text.strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Field 'text' is required")
     try:
         return StreamingResponse(stream_select_query(q), media_type="application/json")
     except ValueError as ve:
