@@ -1,5 +1,5 @@
 import json
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from google import genai
 from google.genai import types
 from collections import defaultdict
@@ -181,8 +181,15 @@ class ProductionLLMContract:
         - "graph": данные для графиков (временные ряды, сравнения)
         - "diagram": диаграммы, распределения
         
+        ВАЖНО:
+        - Пользователь может менять формат вывода в рамках одного диалога - это нормально
+        - Если пользователь сначала запросил текст, а потом таблицу - это не требует уточнения
+        - Требуй уточнение ТОЛЬКО если запрос действительно неясен (не указаны параметры, даты, фильтры)
+        - НЕ требуй уточнение только из-за смены формата вывода
+        
         Если запрос неясен или требует уточнения (например, не указаны параметры, даты, фильтры),
         верни clarification_question с уточняющим вопросом на русском языке.
+        Если запрос понятен, даже если формат отличается от предыдущего, верни clarification_question: null.
         
         Верни JSON:
         {{
@@ -413,8 +420,14 @@ class ProductionLLMContract:
         2. Понятно ли намерение пользователя?
         3. Есть ли неоднозначности в запросе?
         
-        Если запрос неясен или неполон, верни уточняющий вопрос на русском языке.
-        Если запрос понятен, верни null.
+        ВАЖНО:
+        - Пользователь может менять формат вывода (текст/таблица/график) - это НЕ требует уточнения
+        - Пользователь может задавать разные вопросы в рамках одного диалога - это нормально
+        - Требуй уточнение ТОЛЬКО если запрос действительно неполон или неясен
+        - НЕ требуй уточнение только из-за смены формата или типа запроса
+        
+        Если запрос неясен или неполон (не указаны критичные параметры), верни уточняющий вопрос на русском языке.
+        Если запрос понятен, даже если он отличается от предыдущих запросов, верни is_clear: true.
         
         Верни JSON:
         {{
@@ -452,11 +465,18 @@ class ProductionLLMContract:
         
         return None
     
+    def _is_format_change_only(self, clarification: str) -> bool:
+        """Проверяет, связан ли уточняющий вопрос только со сменой формата"""
+        format_keywords = ["в виде", "в таблице", "в графике", "в диаграмме"]
+        clarification_lower = clarification.lower()
+        return any(keyword in clarification_lower for keyword in format_keywords)
+    
     async def process_user_request(self, user_query: UserQuery) -> FinalResponse:
         """Основной пайплайн обработки запроса с поддержкой контекста"""
         # Шаг 0: Проверка ясности запроса
         clarification = await self._check_query_clarity(user_query)
-        if clarification:
+        # Игнорируем уточняющие вопросы, связанные только со сменой формата
+        if clarification and not self._is_format_change_only(clarification):
             response = FinalResponse(
                 content=clarification,
                 output_format="text",
@@ -470,7 +490,8 @@ class ProductionLLMContract:
         # Шаг 1: Определение формата с валидацией
         format_decision = await self._determine_output_format(user_query)
         
-        if format_decision.clarification_question:
+        # Игнорируем уточняющие вопросы, связанные только со сменой формата
+        if format_decision.clarification_question and not self._is_format_change_only(format_decision.clarification_question):
             response = self._build_clarification_response(format_decision, user_query.user_id)
             # Сохраняем в историю
             self._add_to_history(user_query.user_id, user_query.natural_language_query, response.content)
@@ -517,6 +538,64 @@ class ProductionLLMContract:
         )
         
         return response
+    
+    async def format_text_response(
+        self, 
+        user_query: str, 
+        sql_result_data: List[Dict[str, Any]], 
+        user_id: str
+    ) -> str:
+        """Генерация развернутого текстового ответа на основе результатов SQL запроса"""
+        history = self._get_history(user_id)
+        
+        # Формируем данные для промпта
+        data_summary = ""
+        if sql_result_data:
+            # Ограничиваем количество строк для промпта (первые 20)
+            preview_data = sql_result_data[:20]
+            data_summary = json.dumps(preview_data, ensure_ascii=False, indent=2)
+            if len(sql_result_data) > 20:
+                data_summary += f"\n... и еще {len(sql_result_data) - 20} строк(и)"
+        else:
+            data_summary = "Нет данных"
+        
+        prompt = f"""
+        Ты - помощник аналитика данных. Пользователь задал вопрос и получил результаты SQL запроса.
+        
+        ВОПРОС ПОЛЬЗОВАТЕЛЯ: {user_query}
+        
+        РЕЗУЛЬТАТЫ SQL ЗАПРОСА:
+        {data_summary}
+        
+        Сформируй развернутый, понятный ответ на русском языке на основе этих данных.
+        Ответ должен быть:
+        - Естественным и дружелюбным, как от чат-бота
+        - Развернутым и информативным
+        - Структурированным (можно использовать списки, если уместно)
+        - Содержать конкретные цифры и факты из данных
+        - Отвечать на вопрос пользователя полностью
+        
+        Если данных нет, вежливо сообщи об этом.
+        
+        Верни ТОЛЬКО текст ответа, без дополнительных пояснений или метаданных.
+        """
+        
+        try:
+            response = self._call_gemini(
+                "Ты - помощник аналитика данных. Формируешь понятные и развернутые ответы на основе данных из базы данных.",
+                prompt,
+                conversation_history=history,
+                use_history=True
+            )
+            return response.strip()
+        except Exception as e:
+            print(f"Error formatting text response: {e}")
+            # Fallback - простое форматирование
+            if sql_result_data:
+                first_row = sql_result_data[0]
+                values = [str(v) for v in first_row.values() if v is not None]
+                return " ".join(values)
+            return "Данные не найдены"
     
     def generate(self, nl_query: str) -> str:
         """Простой метод для обратной совместимости"""

@@ -53,17 +53,30 @@ async def process_text_stream(req: UserQuery):
         # Выполняем запрос и получаем результат
         execution_result = await execute_sql_query(sql_query, query)
         
+        # Для формата "text" генерируем развернутый текстовый ответ
+        processed_data = execution_result.data
+        text_content = final_response.content
+        if final_response.output_format == "text":
+            # Генерируем развернутый ответ через Gemini
+            text_response = await engine.format_text_response(
+                query,
+                execution_result.data,
+                req.user_id
+            )
+            text_content = text_response
+            processed_data = [{"text": text_response}]
+        
         # Формируем финальный ответ
         response_data = {
-            "content": final_response.content,
+            "content": text_content if final_response.output_format == "text" else final_response.content,
             "output_format": final_response.output_format,
-            "data": execution_result.data,
-            "row_count": execution_result.row_count,
+            "data": processed_data,
+            "row_count": len(processed_data) if final_response.output_format == "text" else execution_result.row_count,
             "execution_time_ms": execution_result.execution_time_ms,
             "metadata": {
                 **final_response.metadata,
                 "execution_time_ms": execution_result.execution_time_ms,
-                "row_count": execution_result.row_count
+                "row_count": len(processed_data) if final_response.output_format == "text" else execution_result.row_count
             }
         }
         
