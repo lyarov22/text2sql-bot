@@ -1,0 +1,218 @@
+Вот отшлифованный контракт для продакшена, дополненный критически важными компонентами:
+
+## Production-Ready LLM Контракт
+
+### 1. Схема данных (строгая типизация)
+```python
+from typing import Literal, Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+
+MCC_CATEGORIES = Literal[
+    "Clothing & Apparel", "Dining & Restaurants", "Electronics & Software",
+    "Fuel & Service Stations", "General Retail & Department", 
+    "Grocery & Food Markets", "Hobby, Books, Sporting Goods",
+    "Home Furnishings & Supplies", "Pharmacies & Health", 
+    "Services (Other)", "Travel & Transportation", "Unknown",
+    "Utilities & Bill Payments"
+]
+
+POS_ENTRY_MODES = Literal["Chip", "QR_Code", "Contactless", "Swipe"]
+WALLET_TYPES = Literal["Bank's QR", "Samsung Pay", "Google Pay", "Apple Pay"]
+CITIES = Literal["Astana", "Almaty", "Shymkent", "Other"]
+TRANSACTION_TYPES = Literal["ATM_WITHDRAWAL", "BILL_PAYMENT", "ECOM", "P2P_IN", "P2P_OUT", "POS", "SALARY"]
+
+class TransactionSchema(BaseModel):
+    id: int = Field(description="Primary key")
+    transaction_id: str = Field(description="Transaction identifier")
+    transaction_timestamp: str = Field(description="Timestamp of transaction")
+    card_id: int = Field(description="Card identifier")
+    expiry_date: str = Field(description="Card expiry date")
+    issuer_bank_name: str = Field(description="Issuer bank name")
+    merchant_id: int = Field(description="Merchant identifier")
+    merchant_mcc: int = Field(description="Merchant MCC code")
+    mcc_category: MCC_CATEGORIES = Field(description="MCC category")
+    merchant_city: CITIES = Field(description="Merchant city")
+    transaction_type: TRANSACTION_TYPES = Field(description="Type of transaction")
+    transaction_amount_kzt: float = Field(description="Amount in KZT")
+    original_amount: float = Field(description="Original amount")
+    transaction_currency: str = Field(description="Currency in ISO format")
+    acquirer_country_iso: str = Field(description="Acquirer ISO country code")
+    pos_entry_mode: Optional[POS_ENTRY_MODES] = Field(description="POS entry mode")
+    wallet_type: Optional[WALLET_TYPES] = Field(description="Wallet type")
+```
+
+### 2. Контракты запросов/ответов
+```python
+class UserQuery(BaseModel):
+    natural_language_query: str
+    user_id: str
+
+class FormatDecision(BaseModel):
+    output_format: Literal["text", "table", "graph", "diagram"]
+    confidence_score: float = Field(ge=0, le=1)
+    clarification_question: Optional[str] = None
+    refined_query: str
+
+class SQLValidation(BaseModel):
+    sql_query: str
+    is_safe: bool
+    matches_intent: bool
+    validation_notes: str
+    alternative_query: Optional[str] = None
+
+class ExecutionResult(BaseModel):
+    data: List[Dict[str, Any]]
+    row_count: int
+    execution_time_ms: float
+
+class FinalResponse(BaseModel):
+    content: str
+    output_format: Literal["text", "table", "graph", "diagram"]
+    data_preview: Optional[List[Dict]] = None
+    metadata: Dict[str, Any]
+```
+
+### 3. Production System Prompt
+```
+SYSTEM_ROLES:
+- Data Analyst Assistant
+- SQL Query Optimizer  
+- Security Validator
+- Result Formatter
+
+GOLDEN_RULES:
+1. SCHEMA_COMPLIANCE: Строго соблюдай TABLE_SCHEMA и типы данных
+2. READ_ONLY: Только SELECT запросы. Запрещены: UPDATE, DELETE, DROP, ALTER, CREATE, INSERT
+3. SECURITY_FIRST: Если запрос рискован - отклони и объясни
+4. CONTEXT_AWARENESS: При недостатке контекста - запроси уточнение
+5. PERFORMANCE: Оптимизируй SQL (индексы, WHERE перед JOIN, LIMIT)
+6. VALIDATION_LOOP: Проверяй соответствие на каждом этапе
+7. TYPE_SAFETY: Все данные строго типизированы
+
+POSTGRES_OPTIMIZATION:
+- Используй EXPLAIN ANALYZE для сложных запросов
+- Применяй индексные подсказки (merchant_city, transaction_timestamp)
+- Ограничивай результат LIMIT 1000 если не указано иное
+- Используй WITH для сложных агрегаций
+
+ERROR_HANDLING:
+- SQL_ERROR -> повторная генерация (макс. 3 попытки)
+- NO_DATA -> понятное сообщение пользователю
+- TIMEOUT -> упрощение запроса
+```
+
+### 4. Улучшенный пайплайн обработки
+```python
+class ProductionLLMContract:
+    
+    async def process_user_request(self, user_query: UserQuery) -> FinalResponse:
+        # Шаг 1: Определение формата с валидацией
+        format_decision = await self._determine_output_format(user_query)
+        
+        if format_decision.clarification_question:
+            return self._build_clarification_response(format_decision)
+        
+        # Шаг 2: Поиск примеров и генерация SQL
+        examples = await self._load_relevant_examples(
+            format_decision.output_format, 
+            format_decision.refined_query
+        )
+        
+        # Шаг 3: Валидация SQL (безопасность + соответствие)
+        sql_validation = await self._generate_and_validate_sql(
+            format_decision.refined_query, 
+            examples
+        )
+        
+        if not sql_validation.is_safe:
+            raise SecurityException("Query violates security policy")
+            
+        if not sql_validation.matches_intent:
+            sql_validation = await self._regenerate_sql_with_feedback(sql_validation)
+        
+        # Шаг 4: Выполнение и форматирование
+        execution_result = await self._execute_sql(sql_validation.sql_query)
+        final_response = await self._format_and_validate_output(
+            execution_result, 
+            format_decision,
+            user_query.natural_language_query
+        )
+        
+        return final_response
+    
+    async def _generate_and_validate_sql(self, query: str, examples: List) -> SQLValidation:
+        """Генерация SQL с многоуровневой валидацией"""
+        prompt = f"""
+        USER_QUERY: {query}
+        SCHEMA: {self.table_schema}
+        EXAMPLES: {examples}
+        
+        Generate optimized PostgreSQL SELECT query:
+        - Use indexes on merchant_city, transaction_timestamp  
+        - Add WHERE conditions before JOINs
+        - Include LIMIT if aggregating large datasets
+        - Validate against user intent
+        
+        Return JSON:
+        {{
+            "sql_query": "string",
+            "explanation": "string",
+            "estimated_performance": "good|medium|poor"
+        }}
+        """
+        
+        response = await self.llm_client.generate(prompt)
+        return self._validate_sql_security(response.sql_query, query)
+```
+
+### 5. Безопасность и мониторинг
+```python
+class SecurityValidator:
+    DANGEROUS_PATTERNS = [
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE)\b",
+        r";\s*(\w|\s)*$",  # Multiple statements
+        r"\b(COPY|GRANT|REVOKE|EXEC)\b",
+        r"(\bUNION\b.*\bSELECT\b)",
+        r"\b(SLEEP|BENCHMARK|WAITFOR)\b"
+    ]
+    
+    def validate_sql(self, sql: str, user_intent: str) -> bool:
+        # Проверка синтаксической безопасности
+        if any(re.search(pattern, sql, re.IGNORECASE) for pattern in self.DANGEROUS_PATTERNS):
+            return False
+            
+        # Проверка соответствия интенту
+        intent_keywords = self._extract_keywords(user_intent)
+        if not self._matches_intent(sql, intent_keywords):
+            return False
+            
+        return True
+```
+
+### 6. Конфигурация для продакшена
+```yaml
+llm_contract:
+  max_retries: 3
+  timeout_seconds: 30
+  max_result_rows: 10000
+  default_limit: 1000
+  
+  validation:
+    sql_safety: true
+    intent_matching: true  
+    performance_check: true
+    
+  monitoring:
+    log_queries: true
+    track_performance: true
+    alert_on_anomalies: true
+```
+
+Этот контракт обеспечивает:
+- **Безопасность**: Многоуровневая валидация SQL
+- **Производительность**: Оптимизированные запросы к PostgreSQL
+- **Надежность**: Повторные попытки и обработка ошибок
+- **Масштабируемость**: Четкие контракты между компонентами
+- **Мониторинг**: Трекинг производительности и аномалий
+
+Готов для интеграции в production-систему!
